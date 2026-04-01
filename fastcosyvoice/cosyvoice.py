@@ -25,6 +25,7 @@ Supports TensorRT acceleration for both Flow decoder and LLM:
 """
 
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -93,6 +94,7 @@ class FastCosyVoice3:
         trt_concurrent: int = 1,
         trt_llm_dtype: str = 'bfloat16',
         trt_llm_max_batch_size: int = 1,
+        trt_llm_concurrent_runners: int = 1,
         trt_llm_kv_cache_tokens: int = 8192,
         flow_n_timesteps: int = 10,
         llm_model_name: str = 'llm.pt',
@@ -112,6 +114,7 @@ class FastCosyVoice3:
             trt_concurrent: Number of concurrent TRT contexts for Flow
             trt_llm_dtype: Data type for TRT-LLM (bfloat16, float16, float32)
             trt_llm_max_batch_size: Max batch size for TRT-LLM engine
+            trt_llm_concurrent_runners: Number of TRT-LLM runner instances (parallel streaming jobs)
             trt_llm_kv_cache_tokens: Max tokens in KV cache (~100MB default, ~12KB/token)
             flow_n_timesteps: Number of diffusion steps for Flow (10=best quality, 5-6=faster)
             llm_model_name: LLM weights filename (e.g. 'llm.pt' or 'llm.rl.pt')
@@ -228,6 +231,7 @@ class FastCosyVoice3:
             self._load_trt_llm(
                 dtype=trt_llm_dtype,
                 max_batch_size=trt_llm_max_batch_size,
+                concurrent_runners=trt_llm_concurrent_runners,
                 kv_cache_tokens=trt_llm_kv_cache_tokens,
             )
             # Fail if TRT-LLM was requested but failed to load
@@ -313,6 +317,7 @@ class FastCosyVoice3:
         self,
         dtype: str = 'bfloat16',
         max_batch_size: int = 1,
+        concurrent_runners: int = 1,
         kv_cache_tokens: int = 8192,
     ):
         """
@@ -324,6 +329,7 @@ class FastCosyVoice3:
         Args:
             dtype: Data type (bfloat16, float16, float32)
             max_batch_size: Maximum batch size
+            concurrent_runners: Number of ModelRunnerCpp instances for parallel streaming
             kv_cache_tokens: Max tokens in KV cache (~100MB default at 8192 tokens)
         """
         import json
@@ -438,7 +444,14 @@ class FastCosyVoice3:
             gather_generation_logits=False,
         )
         
-        self.trt_llm_runner = ModelRunnerCpp.from_dir(**runner_kwargs)
+        self.trt_llm_concurrent_runners = max(1, int(concurrent_runners))
+        self.trt_llm_runner_pool = queue.Queue(maxsize=self.trt_llm_concurrent_runners)
+
+        for i in range(self.trt_llm_concurrent_runners):
+            runner = ModelRunnerCpp.from_dir(**runner_kwargs)
+            self.trt_llm_runner_pool.put(runner)
+            logging.info(f'TRT-LLM runner {i + 1}/{self.trt_llm_concurrent_runners} initialized')
+
         self.trt_llm_loaded = True
         
         # Free PyTorch LLM layers to save VRAM
@@ -733,6 +746,7 @@ class FastCosyVoice3:
     
     def _run_trt_llm_inference_streaming(
         self,
+        runner,
         text: str,
         prompt_text: str,
         prompt_speech_tokens: list,
@@ -803,7 +817,7 @@ class FastCosyVoice3:
         try:
             with torch.inference_mode():
                 # streaming=True returns an iterator that yields incremental outputs
-                outputs_iter = self.trt_llm_runner.generate(
+                outputs_iter = runner.generate(
                     batch_input_ids=batch_input_ids,
                     max_new_tokens=max_new_tokens,
                     end_id=self.eos1_token_id,
@@ -872,8 +886,14 @@ class FastCosyVoice3:
         llm_start_time = time.time()
         token_count = 0
         
+        runner = None
         try:
+            if not hasattr(self, 'trt_llm_runner_pool'):
+                raise RuntimeError('TRT-LLM runner pool is not initialized')
+
+            runner = self.trt_llm_runner_pool.get()
             for speech_token in self._run_trt_llm_inference_streaming(
+                runner=runner,
                 text=text,
                 prompt_text=prompt_text,
                 prompt_speech_tokens=prompt_speech_tokens,
@@ -885,16 +905,18 @@ class FastCosyVoice3:
                 with tokens_lock:
                     tokens_list.append(speech_token)
                 token_count += 1
-            
+
             llm_duration = time.time() - llm_start_time
             tokens_per_sec = token_count / llm_duration if llm_duration > 0 else 0
             logging.info(
                 f'[TRT-LLM] duration={llm_duration:.3f}s, tokens={token_count}, tokens/s={tokens_per_sec:.2f}'
             )
-            
+
         except Exception as e:
             logging.error(f'[TRT-LLM] Error: {e}', exc_info=True)
         finally:
+            if runner is not None:
+                self.trt_llm_runner_pool.put(runner)
             llm_end_flag['done'] = True
     
     def list_available_spks(self):
@@ -1258,9 +1280,11 @@ class FastCosyVoice3:
         llm_gen_start = time.time()
         speech_tokens = []
         
+        runner = None
         try:
             with torch.inference_mode():
-                outputs = self.trt_llm_runner.generate(
+                runner = self.trt_llm_runner_pool.get()
+                outputs = runner.generate(
                     batch_input_ids=batch_input_ids,
                     max_new_tokens=max_new_tokens,
                     end_id=self.eos1_token_id,
@@ -1276,16 +1300,18 @@ class FastCosyVoice3:
                     output_generation_logits=False,
                     return_dict=True,
                 )
-                
+
                 output_ids = outputs["output_ids"]
                 sequence_lengths = outputs["sequence_lengths"]
-                
+
                 output_end = sequence_lengths[0][0].item()
                 generated_ids = output_ids[0][0][input_length:output_end].tolist()
-                
+
                 # Extract speech tokens
                 speech_tokens = self._extract_speech_ids(generated_ids)
         finally:
+            if runner is not None:
+                self.trt_llm_runner_pool.put(runner)
             del batch_input_ids
         
         llm_gen_elapsed = time.time() - llm_gen_start

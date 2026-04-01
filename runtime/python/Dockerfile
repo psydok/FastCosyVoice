@@ -1,13 +1,34 @@
-FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-ENV DEBIAN_FRONTEND=noninteractive
+FROM ghcr.io/astral-sh/uv:0.10.2 AS uv-builder
 
-WORKDIR /opt/CosyVoice
+FROM nvcr.io/nvidia/tritonserver:25.04-trtllm-python-py3 AS builder
 
-RUN sed -i s@/archive.ubuntu.com/@/mirrors.aliyun.com/@g /etc/apt/sources.list
-RUN apt-get update -y
-RUN apt-get -y install git unzip git-lfs g++
-RUN git lfs install
-RUN git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
-# here we use python==3.10 because we cannot find an image which have both python3.8 and torch2.0.1-cu118 installed
-RUN cd CosyVoice && pip3 install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com --no-cache-dir
-RUN cd CosyVoice/runtime/python/grpc && python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. cosyvoice.proto
+COPY --from=uv-builder /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+
+RUN apt update && apt install -y software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt install -y --no-install-recommends python3.10-dev && \
+    apt clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/cosyvoice
+RUN git clone https://github.com/psydok/FastCosyVoice . && \
+    rm -fr .git
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-install-project
+
+FROM nvcr.io/nvidia/tensorrt:24.12-py3
+RUN apt update && apt install -y software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt install -y --no-install-recommends python3.10-dev && \
+    apt clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+COPY --from=builder /opt/cosyvoice /opt/cosyvoice
+WORKDIR /opt/cosyvoice
+
+COPY --from=uv-builder /uv /usr/local/bin/uv
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+RUN uv pip install "grpcio-tools<=1.76.0" "grpcio<=1.76.0"
+RUN cd runtime/python/grpc && uv run -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. cosyvoice.proto
+ENV VLLM_NO_USAGE_STATS=1
