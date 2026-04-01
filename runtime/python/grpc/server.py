@@ -45,9 +45,11 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
             trt_llm_dtype="bfloat16",
             trt_llm_kv_cache_tokens=8192,
             llm_model_name="llm.pt",
-            trt_llm_max_batch_size=1,
-            trt_concurrent=3,
+            trt_llm_max_batch_size=8,
+            trt_concurrent=1,
             trt_llm_concurrent_runners=4,
+            temperature=0.8,
+            top_k=25,
         )
         self.spk_path = None
         logging.info("grpc service initialized")
